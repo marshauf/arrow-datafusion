@@ -15,14 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use arrow_schema::{Field, Schema, SchemaRef};
+use arrow::array::{AsArray, StringArray, StringBuilder};
+use arrow_schema::SchemaRef;
 use async_trait::async_trait;
 use datafusion::{
-    arrow::{
-        array::{ArrayRef, Float32Array, Float64Array},
-        datatypes::DataType,
-        record_batch::RecordBatch,
-    },
+    arrow::{array::ArrayRef, datatypes::DataType, record_batch::RecordBatch},
     execution::{
         context::{QueryPlanner, SessionState},
         runtime_env::RuntimeEnv,
@@ -39,14 +36,9 @@ use datafusion::{
 
 use datafusion::prelude::*;
 use datafusion::{error::Result, physical_plan::functions::make_scalar_function};
-use datafusion_common::{
-    cast::{as_float32_array, as_float64_array},
-    tree_node::{Transformed, TreeNode},
-    DFSchemaRef, DataFusionError,
-};
+use datafusion_common::{DFSchemaRef, DataFusionError};
 use datafusion_expr::{
-    expr::ScalarUDF, Extension, LogicalPlan, Subquery, UserDefinedLogicalNode,
-    UserDefinedLogicalNodeCore,
+    Extension, LogicalPlan, UserDefinedLogicalNode, UserDefinedLogicalNodeCore,
 };
 use datafusion_optimizer::{optimize_children, OptimizerConfig, OptimizerRule};
 use std::{
@@ -57,91 +49,80 @@ use std::{
 
 use futures::{FutureExt, StreamExt};
 
-// This example demonstrates executing an async user defined function (pow).
-// Async UDFs aren't supported at the moment. This is a workaround example.
-// In this example a user defined `QueryPlanner` (PowQueryPlanner) and an `OptimizerRule` (PowOptimizerRule) is provided to a SessionState.
-// The `QueryPlanner` registers an `ExtensionPlanner` (PowPlanner).
-// The `OptimizerRule` (PowOptimizerRule) replaces a `LogicalPlan::Projection` with a `LogicalPlan::Extension`.
+// This example demonstrates creating an async user defined function ('url-get').
+//
+// async user defined functions are not supported directly, but they
+// can be implemented using DataFusion's plan rewriting and extension
+// mechanisms.
+//
+// In this example a user defined `QueryPlanner` (GetUrlQueryPlanner) and
+// an `OptimizerRule` (GetUrlOptimizerRule) are used to rewrite instances
+// of `url-get` into a custom user defined extension nodes.
+//
+// TODO update:
+//
+// The `QueryPlanner` registers an `ExtensionPlanner` (GetUrlPlanner).
+// The `OptimizerRule` (GetUrlOptimizerRule) replaces a `LogicalPlan::Projection` with a `LogicalPlan::Extension`.
 // The extension hosts a user defined node (PowNode).
-// When creating a physical plan for the extension, the node is casted to a user defined execution plan (PowExec) by the `ExtensionPlanner`.
+//
+// When creating a physical plan for the extension, the node is casted to a user defined execution plan (GetUrlExec) by the `ExtensionPlanner`.
+///
 // On plan execution the user defined async function (pow) is called with a `RecordBatch`.
 
 // create local execution context with an in-memory table and
 // register an user defined QueryPlanner and a OptimizerRule.
 fn create_context() -> Result<SessionContext> {
-    // define a schema.
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("a", DataType::Float32, false),
-        Field::new("b", DataType::Float64, false),
-    ]));
-
     // define data.
-    let batch = RecordBatch::try_new(
-        schema,
-        vec![
-            Arc::new(Float32Array::from(vec![2.1, 3.1, 4.1, 5.1])),
-            Arc::new(Float64Array::from(vec![1.0, 2.0, 3.0, 4.0])),
-        ],
-    )?;
+    let urls = StringArray::from(vec![
+        "http://example.com/index.html",
+        "http://example.com/data.txt",
+    ]);
+
+    let batch = RecordBatch::try_from_iter(vec![("url", Arc::new(urls) as _)])?;
 
     // declare a state with a query planner and an optimizer rule
     let config = SessionConfig::new();
     let runtime = Arc::new(RuntimeEnv::default());
     let state = SessionState::with_config_rt(config, runtime)
-        .with_query_planner(Arc::new(PowQueryPlanner {}))
-        .add_optimizer_rule(Arc::new(PowOptimizerRule {}));
+        .with_query_planner(Arc::new(GetUrlQueryPlanner {}))
+        .add_optimizer_rule(Arc::new(GetUrlOptimizerRule {}));
 
-    // declare a new context. In spark API, this corresponds to a new spark SQLsession
     let ctx = SessionContext::with_state(state);
-
-    // declare a table in memory. In spark API, this corresponds to createDataFrame(...).
     ctx.register_batch("t", batch)?;
     Ok(ctx)
 }
 
-// pow is similar to the pow function in the simple_udf example
-// in this example the function is async. It's not registered directly in the SessionContext,
-// but a placeholder UDF is replaced with a custom Extension.
-// The custom Extension manages executing this function on plan execution.
-//
-// The input type depends on the placeholder UDF types.
-// The output type is not from the placeholder UDF, but returned from this function.
-//
-// Pow calculates a^b in an async context.
-async fn pow(batch: Result<RecordBatch>) -> Result<RecordBatch> {
-    batch.map(|b| {
-        // 1. get columns from batch and cast them
-        let args = b.columns();
-        let base = as_float32_array(&args[0]).expect("cast failed");
-        let exponent = as_float64_array(&args[1]).expect("cast failed");
+// get_url is an async function and thus could do network I/O or any
+// other function. In this example it just returns example data, but
+// in a real example it could return anything.
+async fn get_url(schema: SchemaRef, input: Result<RecordBatch>) -> Result<RecordBatch> {
+    let input = input?;
+    let urls: &StringArray = input.column(0).as_string();
 
-        // 2. perform the computation
-        let array = base
-            .iter()
-            .zip(exponent.iter())
-            .map(|(base, exponent)| {
-                match (base, exponent) {
-                    // in arrow, any value can be null.
-                    // Here we decide to make our UDF to return null when either base or exponent is null.
-                    (Some(base), Some(exponent)) => Some((base as f64).powf(exponent)),
-                    _ => None,
-                }
-            })
-            .collect::<Float64Array>();
+    // in this example, pretend to fetch the contents from some remote
+    // server.
+    let mut contents = StringBuilder::new();
+    for url in urls.iter() {
+        match url {
+            Some(url) => {
+                // pretend to fetch the actual data async'hronously
+                contents.append_value(format!("Remote data from {url}"));
+            }
+            None => {
+                // ignore NULL input rows
+                contents.append_null();
+            }
+        }
+    }
 
-        // 3. Define a new schema and construct a new RecordBatch with the computed data
-        let schema =
-            Arc::new(Schema::new(vec![Field::new("a", DataType::Float64, false)]));
-        RecordBatch::try_new(schema, vec![Arc::new(array)]).unwrap()
-    })
+    let batch = RecordBatch::try_new(schema, vec![Arc::new(contents.finish()) as _])?;
+
+    Ok(batch)
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    let ctx = create_context()?;
-
+fn register_udf(ctx: &SessionContext) {
     // First, declare the placeholder UDF
-    let placeholder_pow = |_args: &[ArrayRef]| {
+    let placeholder_udf = |_args: &[ArrayRef]| {
         Err(datafusion_common::DataFusionError::NotImplemented(
             "Not supposed to be executed.".to_string(),
         ))
@@ -149,39 +130,53 @@ async fn main() -> Result<()> {
 
     // the function above expects an `ArrayRef`, but DataFusion may pass a scalar to a UDF.
     // thus, we use `make_scalar_function` to decorare the closure so that it can handle both Arrays and Scalar values.
-    let placeholder_pow = make_scalar_function(placeholder_pow);
+    let placeholder_udf = make_scalar_function(placeholder_udf);
 
-    // Next:
-    // * give it a name so that it can be recognised
-    // * the input type is checked and is important
-    // * the output type isn't used in this example, the real function provides the type via a
-    // schema
-    let placeholder_pow = create_udf(
-        "pow",
-        vec![DataType::Float64, DataType::Float64],
-        Arc::new(DataType::Null),
-        // Needs to be volatile to be optimized to the async pow function
+    let placeholder_udf = create_udf(
+        // The name by which it will be called
+        "get_url",
+        // the input argument type. DataFusion will check this
+        vec![DataType::Utf8],
+        // The output data type
+        Arc::new(DataType::Utf8),
+        // If the function can be optimized away. Volatile means
+        // DataFusion will not rewrite this during plan time.
         Volatility::Volatile,
-        placeholder_pow,
+        // the actual function implementation
+        placeholder_udf,
     );
 
-    // at this point, we register the place holder
-    ctx.register_udf(placeholder_pow);
+    // at this point, we register the placeholder so it can be called as a normal function
+    ctx.register_udf(placeholder_udf);
+}
 
-    const QUERY: &str = "SELECT pow(a, b) FROM t";
+#[tokio::main]
+async fn main() -> Result<()> {
+    let ctx = create_context()?;
+    register_udf(&ctx);
 
-    let df = ctx.sql(QUERY).await?;
+    // Show the input
+    println!("Input:");
+    ctx.sql("SELECT * from t").await?.show().await?;
 
-    // print the results
-    df.show().await?;
+    // Call the UDF from SQL
+    println!("Output");
+    ctx.sql("SELECT get_url(url) FROM t").await?.show().await?;
+
+    // Show the plan
+    println!("Output");
+    ctx.sql("EXPLAIN SELECT get_url(url) FROM t")
+        .await?
+        .show()
+        .await?;
 
     Ok(())
 }
 
-struct PowQueryPlanner {}
+struct GetUrlQueryPlanner {}
 
 #[async_trait]
-impl QueryPlanner for PowQueryPlanner {
+impl QueryPlanner for GetUrlQueryPlanner {
     // Given a `LogicalPlan` created from above, create an `ExecutionPlan` suitable for execution
     async fn create_physical_plan(
         &self,
@@ -191,7 +186,7 @@ impl QueryPlanner for PowQueryPlanner {
         // Teach the default physical planner how to plan Pow nodes.
         let physical_planner =
             DefaultPhysicalPlanner::with_extension_planners(vec![Arc::new(
-                PowPlanner {},
+                GetUrlPlanner {},
             )]);
         // Delegate most work of physical planning to the default physical planner
         physical_planner
@@ -200,11 +195,11 @@ impl QueryPlanner for PowQueryPlanner {
     }
 }
 
-// Physical planner for Pow nodes
-struct PowPlanner {}
+// Physical planner for UrlPlanner nodes
+struct GetUrlPlanner {}
 
 #[async_trait]
-impl ExtensionPlanner for PowPlanner {
+impl ExtensionPlanner for GetUrlPlanner {
     // Create a physical plan for an extension node
     async fn plan_extension(
         &self,
@@ -215,8 +210,8 @@ impl ExtensionPlanner for PowPlanner {
         _session_state: &SessionState,
     ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
         Ok(
-            if let Some(pow_node) = node.as_any().downcast_ref::<PowNode>() {
-                Some(Arc::new(PowExec {
+            if let Some(pow_node) = node.as_any().downcast_ref::<GetUrlNode>() {
+                Some(Arc::new(GetUrlExec {
                     schema: pow_node.schema.clone(),
                     inputs: physical_inputs.to_vec(),
                 }))
@@ -227,88 +222,59 @@ impl ExtensionPlanner for PowPlanner {
     }
 }
 
-struct PowOptimizerRule {}
+struct GetUrlOptimizerRule {}
 
-impl OptimizerRule for PowOptimizerRule {
+impl OptimizerRule for GetUrlOptimizerRule {
     fn try_optimize(
         &self,
         plan: &LogicalPlan,
         config: &dyn OptimizerConfig,
     ) -> Result<Option<LogicalPlan>> {
-        // recurse down and optimize children first
+        // recurse down and optimize children first, if possible
         let optimized_plan = optimize_children(self, plan, config)?;
+
+        // Get a reference either to the  optimized plan or the input.
+        let optimized_plan = optimized_plan.as_ref().unwrap_or(plan);
+
+        // rewrite LogicalPlan::Projection into an extension node.
         match optimized_plan {
-            Some(LogicalPlan::Projection(proj)) => {
+            LogicalPlan::Projection(proj) => {
                 Ok(Some(LogicalPlan::Extension(Extension {
-                    node: Arc::new(PowNode {
+                    node: Arc::new(GetUrlNode {
                         schema: proj.schema.clone(),
                         input: (*proj.input).clone(),
                         expr: proj.expr.clone(),
                     }),
                 })))
             }
-            Some(optimized_plan) => Ok(Some(optimized_plan)),
-            None => match plan {
-                LogicalPlan::Projection(proj) => {
-                    Ok(Some(LogicalPlan::Extension(Extension {
-                        node: Arc::new(PowNode {
-                            schema: proj.schema.clone(),
-                            input: (*proj.input).clone(),
-                            expr: proj.expr.clone(),
-                        }),
-                    })))
-                }
-                _ => Ok(None),
-            },
+            // no rewrite is possible
+            _ => Ok(None),
         }
     }
 
     fn name(&self) -> &str {
-        "pow"
+        "get_url rewriter"
     }
 }
 
-// use rewrite_expr to modify the expression tree.
-fn rewrite_expr(expr: Expr, schema: DFSchemaRef, input: &LogicalPlan) -> Result<Expr> {
-    expr.transform(&|expr| {
-        // closure is invoked for all sub expressions
-        Ok(match expr {
-            Expr::ScalarUDF(ScalarUDF { fun: _, ref args }) => {
-                let subplan = LogicalPlan::Extension(Extension {
-                    node: Arc::new(PowNode {
-                        schema: schema.clone(),
-                        input: input.clone(),
-                        expr: vec![args[0].clone()],
-                    }),
-                });
-                // Expr::ScalarSubquery doesn't support LogicalPlan::Extension as a subquery
-                Transformed::Yes(Expr::ScalarSubquery(Subquery {
-                    subquery: Arc::new(subplan),
-                    outer_ref_columns: vec![],
-                }))
-            }
-            _ => Transformed::No(expr),
-        })
-    })
-}
-
+/// Implements a custom DataFusion LogicalPlan node that invokes the
 #[derive(PartialEq, Eq, Hash)]
-struct PowNode {
+struct GetUrlNode {
     input: LogicalPlan,
     schema: DFSchemaRef,
     expr: Vec<Expr>,
 }
 
-impl Debug for PowNode {
+impl Debug for GetUrlNode {
     // For PowNode, use explain format for the Debug format. Other types of nodes may
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         UserDefinedLogicalNodeCore::fmt_for_explain(self, f)
     }
 }
 
-impl UserDefinedLogicalNodeCore for PowNode {
+impl UserDefinedLogicalNodeCore for GetUrlNode {
     fn name(&self) -> &str {
-        "pow"
+        "get_url"
     }
 
     fn inputs(&self) -> Vec<&LogicalPlan> {
@@ -336,19 +302,19 @@ impl UserDefinedLogicalNodeCore for PowNode {
     }
 }
 
-struct PowExec {
+struct GetUrlExec {
     schema: DFSchemaRef,
     inputs: Vec<Arc<dyn ExecutionPlan>>,
 }
 
-impl Debug for PowExec {
+impl Debug for GetUrlExec {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "PowExec")
+        write!(f, "GetUrlExec")
     }
 }
 
 #[async_trait]
-impl ExecutionPlan for PowExec {
+impl ExecutionPlan for GetUrlExec {
     // Return a reference to Any that can be used for downcasting
     fn as_any(&self) -> &dyn Any {
         self
@@ -378,14 +344,13 @@ impl ExecutionPlan for PowExec {
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        Ok(Arc::new(PowExec {
+        Ok(Arc::new(GetUrlExec {
             schema: self.schema.clone(),
             inputs: children,
         }))
     }
 
-    // Execute one partition and return an iterator over `RecordBatch`.
-    // The iterator calls the user defined async function `pow`.
+    // Execute the specified partition and return an stream of RecordBatch
     fn execute(
         &self,
         partition: usize,
@@ -393,13 +358,18 @@ impl ExecutionPlan for PowExec {
     ) -> Result<SendableRecordBatchStream> {
         if 0 != partition {
             return Err(DataFusionError::Internal(format!(
-                "PowExec invalid partition {partition}"
+                "GetUrlExec invalid partition {partition}"
             )));
         }
+
+        let schema_captured = self.schema();
+
+        // Inovke the
         let s = self.inputs[0]
             .execute(partition, context)?
-            .flat_map(|b| pow(b).into_stream());
-        let s = RecordBatchStreamAdapter::new((*self.schema).clone().into(), s);
+            .flat_map(move |b| get_url(schema_captured.clone(), b).into_stream());
+
+        let s = RecordBatchStreamAdapter::new(self.schema(), s);
         Ok(Box::pin(s))
     }
 
@@ -409,8 +379,10 @@ impl ExecutionPlan for PowExec {
         f: &mut std::fmt::Formatter,
     ) -> std::fmt::Result {
         match t {
+            // Needed when merged to main
+            //DisplayFormatType::Default | DisplayFormatType::Verbose => {
             DisplayFormatType::Default => {
-                write!(f, "PowExec")
+                write!(f, "GetUrlExec")
             }
         }
     }
